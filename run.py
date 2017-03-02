@@ -7,6 +7,7 @@ from glob import glob
 from subprocess import Popen, PIPE
 from shutil import rmtree
 import subprocess
+from warnings import warn
 
 def run(command, env={}, ignore_errors=False):
     merged_env = os.environ
@@ -34,8 +35,10 @@ parser.add_argument('output_dir', help='The directory where the output files '
                     'participant level analysis.')
 parser.add_argument('analysis_level', help='Level of the analysis that will be performed. '
                     'Multiple participant level analyses can be run independently '
-                    '(in parallel) using the same output_dir.',
-                    choices=['participant', 'group'])
+                    '(in parallel) using the same output_dir. '
+                    '"group1" creates study specific group template. '
+                    '"group2 exports group stats tables for cortical parcellation and subcortical segmentation.',
+                    choices=['participant', 'group1', 'group2'])
 parser.add_argument('--participant_label', help='The label of the participant that should be analyzed. The label '
                    'corresponds to sub-<participant_label> from the BIDS spec '
                    '(so it does not include "sub-"). If this parameter is not '
@@ -68,6 +71,16 @@ parser.add_argument('--refine_pial', help='If the dataset contains 3D T2 or T2 F
 parser.add_argument('--hires_mode', help="Submilimiter (high resolution) processing. 'auto' - use only if <1.0mm data detected, 'enable' - force on, 'disable' - force off",
                     choices=['auto', 'enable', 'disable'],
                     default='auto')
+parser.add_argument('--parcellations', help='Group2 option: cortical parcellation(s) to extract stats from.',
+                    choices=["aparc", "aparc.a2009s"],
+                    default=["aparc"],
+                    nargs="+")
+parser.add_argument('--measurements', help='Group2 option: cortical measurements to extract stats for.',
+                    choices=["area", "volume", "thickness", "thicknessstd", "meancurv", "gauscurv", "foldind",
+                             "curvind"],
+                    default=["thickness"],
+                    nargs="+")
+
 parser.add_argument('-v', '--version', action='version',
                     version='BIDS-App example version {}'.format(__version__))
 
@@ -76,16 +89,40 @@ args = parser.parse_args()
 run("bids-validator " + args.bids_dir)
 
 subject_dirs = glob(os.path.join(args.bids_dir, "sub-*"))
+
 if args.acquisition_label:
     acq_tpl = "*acq-%s*" % args.acquisition_label
 else:
     acq_tpl = "*"
 
+# if there are session folders, check if study is truly longitudinal by
+# searching for the first subject with more than one valid sessions
+multi_session_study = False
+if glob(os.path.join(args.bids_dir, "sub-*", "ses-*")):
+    subjects = [subject_dir.split("-")[-1] for subject_dir in subject_dirs]
+    for subject_label in subjects:
+        session_dirs = glob(os.path.join(args.bids_dir,"sub-%s"%subject_label,"ses-*"))
+        sessions = [os.path.split(dr)[-1].split("-")[-1] for dr in session_dirs]
+        n_valid_sessions = 0
+        for session_label in sessions:
+            if glob(os.path.join(args.bids_dir, "sub-%s"%subject_label,
+                                                "ses-%s"%session_label,
+                                                "anat",
+                                                "%s_T1w.nii*"%acq_tpl)):
+                n_valid_sessions += 1
+        if n_valid_sessions > 1:
+            multi_session_study = True
+            break
+
+if multi_session_study and (args.multiple_sessions == "longitudinal"):
+    longitudinal_study = True
+else:
+    longitudinal_study = False
+
 if args.refine_pial_acquisition_label:
     acq_t2 = "*acq-%s*" % args.refine_pial_acquisition_label
 else:
     acq_t2 = "*"
-
 
 subjects_to_analyze = []
 # only for a subset of subjects
@@ -112,23 +149,10 @@ if args.analysis_level == "participant":
             ignore_errors=True)
 
     for subject_label in subjects_to_analyze:
-
-        # Check for multiple sessions to combine as a multiday session or as a longitudinal stream
         session_dirs = glob(os.path.join(args.bids_dir,"sub-%s"%subject_label,"ses-*"))
         sessions = [os.path.split(dr)[-1].split("-")[-1] for dr in session_dirs]
-        longitudinal_study = False
-        n_valid_sessions = 0
-        for session_label in sessions:
-            if glob(os.path.join(args.bids_dir, "sub-%s"%subject_label,
-                                                "ses-%s"%session_label,
-                                                "anat",
-                                                "%s_T1w.nii*"%acq_tpl)):
-                n_valid_sessions += 1
-        if n_valid_sessions > 1 and args.multiple_sessions == "longitudinal":
-            longitudinal_study = True
 
         timepoints = []
-
         if len(sessions) > 0 and longitudinal_study == True:
             # Running each session separately, prior to doing longitudinal pipeline
             for session_label in sessions:
@@ -336,7 +360,7 @@ if args.analysis_level == "participant":
                 print(cmd)
                 run(cmd)
 
-elif args.analysis_level == "group":    	# running group level
+elif args.analysis_level == "group1":    	# running group level
     if len(subjects_to_analyze) > 1:
         # generate study specific template
         fsids = ["sub-%s"%s for s in subjects_to_analyze]
@@ -354,4 +378,61 @@ elif args.analysis_level == "group":    	# running group level
                 cmd = "mris_register -curv %s %s %s"%(sphere_file, tif_file, reg_file)
                 run(cmd, env={"SUBJECTS_DIR": output_dir})
     else:
-        print("Only one subject included in the analysis. Skipping group level")
+        print("Only one subject included in the analysis. Skipping group1 level")
+
+
+elif args.analysis_level == "group2":  # running stats tables
+    table_dir = os.path.join(output_dir, "00_group2_stats_tables")
+    if not os.path.isdir(table_dir):
+        os.makedirs(table_dir)
+    print("Writing stats tables to %s." % table_dir)
+
+    # To make the group analysis independet of participant_level --multiple_sessions option, we are looking for
+    # *long* folders in the output_dir. If there exists one, we assume the study is longitudinal and we only
+    # consider *long* freesurfer folders. Else we search for sub-<subject_label> freesurfer folders. If subjects
+    #  cannot be found in freesurfer folder, an exception is raised.
+    subjects = []
+    if glob(os.path.join(output_dir, "sub-*_ses-*.long.sub-*")):
+        for s in subjects_to_analyze:
+            fs_sessions = sorted(glob(os.path.join(output_dir, "sub-{s}_ses-*.long.sub-{s}*".format(s=s))))
+            if fs_sessions:
+                subjects += [os.path.basename(fssub) for fssub in fs_sessions]
+            else:
+                raise Exception("No freesurfer sessions found for %s in %s" % (s, output_dir))
+    else:
+        for s in subjects_to_analyze:
+            if os.path.isdir(os.path.join(output_dir, "sub-" + s)):
+                subjects.append("sub-" + s)
+            else:
+                raise Exception("No freesurfer subject found for %s in %s" % (s, output_dir))
+    subjects_str = " ".join(subjects)
+
+    if len(subjects) > 0:
+        # create cortical stats
+        for p in args.parcellations:
+            for h in ["lh", "rh"]:
+                for m in args.measurements:
+                    table_file = os.path.join(table_dir, "{h}.{p}.{m}.tsv".format(h=h, p=p, m=m))
+                    if os.path.isfile(table_file):
+                        warn("Replace old file %s" % table_file)
+                        os.remove(table_file)
+                    cmd = "python3 `which aparcstats2table` --hemi {h} --subjects {subjects} --parc {p} --meas {m} " \
+                          "--tablefile {table_file}".format(h=h, subjects=subjects_str, p=p, m=m,
+                                                            table_file=table_file)
+                    print("Creating cortical stats table for {h} {p} {m}".format(h=h, p=p, m=m))
+                    run(cmd, env={"SUBJECTS_DIR": output_dir})
+
+        # create subcortical stats
+        table_file = os.path.join(table_dir, "aseg.tsv")
+        if os.path.isfile(table_file):
+            warn("Replace old file %s" % table_file)
+            os.remove(table_file)
+        cmd = "python3 `which asegstats2table` --subjects {subjects} --meas volume --tablefile {" \
+              "table_file}".format(subjects=subjects_str, table_file=table_file)
+        print("Creating subcortical stats table.")
+        run(cmd, env={"SUBJECTS_DIR": output_dir})
+
+        print("\nTable export finished for %d subjects/sessions." % len(subjects))
+
+    else:
+        print("\nNo subjects included in the analysis. Skipping group2 level.")
